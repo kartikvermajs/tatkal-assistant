@@ -49,6 +49,8 @@ class IRCTCWorkflow:
         self._aborted = False
         self.payment_mode: Optional[str] = None
         self.upi_id: str = ""
+        self.last_keep_alive_time: float = 0.0
+        self.keep_alive_interval: float = 25.0
 
     @property
     def is_aborted(self) -> bool:
@@ -101,6 +103,136 @@ class IRCTCWorkflow:
             return False
         except Exception:
             return False
+
+    def handle_session_expired(self) -> bool:
+        """Fast-recovery handler: dismiss session expired dialog, reopen login modal,
+        and focus User Name field.
+        """
+        try:
+            page = self._ensure_page()
+            log_event("Session expired detected - executing fast-recovery")
+
+            # 1. Dismiss session expired alert/dialog if visible
+            dismiss_loc = page.locator(
+                "button:has-text('OK'), button:has-text('Ok'), span:has-text('OK'), "
+                ".ui-dialog-titlebar-close, button[aria-label='Close'], div.modal-footer button"
+            )
+            if dismiss_loc.count() > 0:
+                try:
+                    dismiss_loc.first.click(timeout=1000)
+                except Exception:
+                    pass
+
+            # 2. Re-open login modal if not already open
+            login_modal_open = (
+                page.locator("input[placeholder*='User Name' i], input#userId, input[formcontrolname='userId'], app-login").count() > 0
+                and page.locator("input[placeholder*='User Name' i], input#userId, input[formcontrolname='userId']").first.is_visible()
+            )
+            if not login_modal_open:
+                login_btn = page.locator(
+                    "a.search_btn.loginText, a:has-text('LOGIN'), a:has-text('Login'), button:has-text('LOGIN'), [data-testid='login-link']"
+                )
+                if login_btn.count() > 0:
+                    try:
+                        login_btn.first.click(timeout=2000)
+                    except Exception:
+                        pass
+
+            # 3. Focus User Name field (no CAPTCHA on standard non-beta IRCTC web login modal)
+            username_loc = page.locator("input[placeholder*='User Name' i], input#userId, input[formcontrolname='userId'], input[type='text']")
+            if username_loc.count() > 0:
+                try:
+                    username_loc.first.focus()
+                except Exception:
+                    pass
+
+            # 4. Transition state machine to USER_LOGIN_REQUIRED
+            if self.sm.can_transition_to(BookingState.USER_LOGIN_REQUIRED):
+                self.sm.transition_to(BookingState.USER_LOGIN_REQUIRED, "Session expired - login modal reopened automatically")
+
+            self._update_status("SESSION EXPIRED: Login modal reopened. Please enter credentials & Sign In.")
+            return True
+        except Exception as exc:
+            log_event(f"Error handling session expiry: {exc}")
+            return False
+
+    def open_login_modal(self) -> bool:
+        """Open the IRCTC login modal and focus User Name input."""
+        try:
+            page = self._ensure_page()
+            username_loc = page.locator("input[placeholder*='User Name' i], input#userId, input[formcontrolname='userId']")
+            if username_loc.count() > 0 and username_loc.first.is_visible():
+                try:
+                    username_loc.first.focus()
+                except Exception:
+                    pass
+                return True
+
+            login_btn = page.locator(
+                "a.search_btn.loginText, a:has-text('LOGIN'), a:has-text('Login'), button:has-text('LOGIN'), [data-testid='login-link']"
+            )
+            if login_btn.count() > 0:
+                try:
+                    login_btn.first.click(timeout=3000)
+                except Exception:
+                    pass
+                if username_loc.count() > 0:
+                    try:
+                        username_loc.first.focus()
+                    except Exception:
+                        pass
+                return True
+            return False
+        except Exception as exc:
+            log_event(f"Error opening login modal: {exc}")
+            return False
+
+    def send_keep_alive_ping(self) -> bool:
+        """Send safe, non-disruptive activity signals to prevent IRCTC session timeout.
+
+        Dispatches DOM mouse/scroll/interaction events recognized by IRCTC's client-side Angular
+        inactivity monitor and inspects session health.
+        """
+        if self._aborted:
+            return False
+        try:
+            page = self._ensure_page()
+
+            # 1. Check if session has expired; if so, trigger fast recovery
+            if self.check_session_expired():
+                self.handle_session_expired()
+                return False
+
+            # 2. Reset IRCTC Angular client-side activity timers by dispatching events
+            page.evaluate(
+                """() => {
+                    window.dispatchEvent(new Event('mousemove'));
+                    window.dispatchEvent(new Event('scroll'));
+                    window.dispatchEvent(new Event('keydown'));
+                    document.dispatchEvent(new Event('mousemove'));
+                }"""
+            )
+            self.last_keep_alive_time = time.time()
+            log_event("Keep-alive heartbeat ping dispatched")
+            return True
+        except Exception as exc:
+            log_event(f"Keep-alive heartbeat failed: {exc}")
+            return False
+
+    def check_and_send_keep_alive(self, force: bool = False) -> bool:
+        """Send keep-alive heartbeat if in eligible state (USER_LOGGED_IN, WAITING_FOR_TATKAL)
+        and 25 seconds have elapsed since the last heartbeat.
+        """
+        if self._aborted:
+            return False
+        eligible_states = {BookingState.USER_LOGGED_IN, BookingState.WAITING_FOR_TATKAL}
+        if self.sm.current_state not in eligible_states and not force:
+            return False
+
+        now = time.time()
+        if force or (now - self.last_keep_alive_time) >= self.keep_alive_interval:
+            return self.send_keep_alive_ping()
+        return False
 
     # ==================== Step 1: Open Portal ====================
 
@@ -226,12 +358,8 @@ class IRCTCWorkflow:
                 return WorkflowStepResult(success=False, state=BookingState.FAILURE, message=reason)
 
             if self.check_session_expired():
+                self.handle_session_expired()
                 reason = "IRCTC session expired. Please log in again to continue."
-                if self.sm.can_transition_to(BookingState.USER_LOGIN_REQUIRED):
-                    self.sm.transition_to(BookingState.USER_LOGIN_REQUIRED, reason)
-                else:
-                    self.sm.fail(reason)
-                self._update_status(f"SESSION EXPIRED: {reason}")
                 return WorkflowStepResult(success=False, state=self.sm.current_state, message=reason)
 
             # Check if journey form inputs exist on the page (supports both live IRCTC and mocks)
@@ -312,12 +440,8 @@ class IRCTCWorkflow:
             cleaned_train = str(train_number).strip()
 
             if self.check_session_expired():
+                self.handle_session_expired()
                 reason = "IRCTC session expired. Please log in again to continue."
-                if self.sm.can_transition_to(BookingState.USER_LOGIN_REQUIRED):
-                    self.sm.transition_to(BookingState.USER_LOGIN_REQUIRED, reason)
-                else:
-                    self.sm.fail(reason)
-                self._update_status(f"SESSION EXPIRED: {reason}")
                 return WorkflowStepResult(success=False, state=self.sm.current_state, message=reason)
 
             self._update_status(f"Selecting train {cleaned_train}...")
@@ -382,12 +506,8 @@ class IRCTCWorkflow:
             display_name = config.get_class_display_name(cleaned_class)
 
             if self.check_session_expired():
+                self.handle_session_expired()
                 reason = "IRCTC session expired. Please log in again to continue."
-                if self.sm.can_transition_to(BookingState.USER_LOGIN_REQUIRED):
-                    self.sm.transition_to(BookingState.USER_LOGIN_REQUIRED, reason)
-                else:
-                    self.sm.fail(reason)
-                self._update_status(f"SESSION EXPIRED: {reason}")
                 return WorkflowStepResult(success=False, state=self.sm.current_state, message=reason)
 
             self._update_status(f"Selecting class {display_name} ({cleaned_class})...")
@@ -857,12 +977,8 @@ class IRCTCWorkflow:
 
             # Check session expiration
             if self.check_session_expired():
+                self.handle_session_expired()
                 reason = "IRCTC session expired. Please log in again to continue."
-                if self.sm.can_transition_to(BookingState.USER_LOGIN_REQUIRED):
-                    self.sm.transition_to(BookingState.USER_LOGIN_REQUIRED, reason)
-                else:
-                    self.sm.fail(reason)
-                self._update_status(f"SESSION EXPIRED: {reason}")
                 return WorkflowStepResult(success=False, state=self.sm.current_state, message=reason)
 
             # Check explicit payment failure indicators on page

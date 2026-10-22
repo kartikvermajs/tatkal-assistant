@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
         self._current_workflow: Optional[IRCTCWorkflow] = None
         self._opening_alert_fired = False
         self._ewallet_reminder_fired = False
+        self._login_alarm_fired = False
         self._auto_start_triggered = False
         self.settings: ApplicationSettings = self.db.load_settings()
         self.setWindowTitle(config.APP_NAME)
@@ -555,6 +556,66 @@ class MainWindow(QMainWindow):
                 self.notification_service.play_sound()
                 self.status_label.setText("REMINDER: Verify IRCTC eWallet balance before opening")
                 self.status_label.setStyleSheet("color: #0284C7; font-weight: bold;")
+
+        # Pre-Tatkal Login Alarm at T - 90s (optimal login window to prevent session timeout)
+        if 0 < rem_secs <= 90:
+            if not self._login_alarm_fired:
+                self._login_alarm_fired = True
+                is_logged_in = False
+                if self.browser_manager.is_running():
+                    page = self.browser_manager.get_page()
+                    if page:
+                        try:
+                            is_logged_in = (
+                                page.locator("a:has-text('Logout'), span:has-text('Welcome')").count() > 0
+                            )
+                        except Exception:
+                            is_logged_in = False
+
+                if is_logged_in:
+                    self.status_label.setText("SESSION ACTIVE (T - 90s): Keep-alive heartbeat protecting session")
+                    self.status_label.setStyleSheet("color: #166534; font-weight: bold;")
+                    if self.current_workflow:
+                        self.current_workflow.send_keep_alive_ping()
+                else:
+                    self.status_label.setText("LOGIN RECOMMENDED (T - 90s): Open login & sign in for Tatkal")
+                    self.status_label.setStyleSheet("color: #D97706; font-weight: bold;")
+                    if self.browser_manager.is_running():
+                        page = self.browser_manager.get_page()
+                        if page:
+                            if self.current_workflow is None:
+                                self.current_workflow = IRCTCWorkflow(page=page, status_callback=self._update_workflow_status)
+                                self.current_workflow.sm.add_listener(self._on_state_machine_transition)
+                            self.current_workflow.open_login_modal()
+
+                self.notification_service.trigger_checkpoint_alert(
+                    "LOGIN RECOMMENDED (T - 90s)",
+                    parent_widget=self,
+                    sound=self.sound_alert_cb.isChecked(),
+                    visual=self.visual_alert_cb.isChecked(),
+                )
+        elif rem_secs > 90:
+            self._login_alarm_fired = False
+
+        # Background Session Keep-Alive Heartbeat (runs every 25s while in USER_LOGGED_IN or WAITING_FOR_TATKAL state)
+        if self.browser_manager.is_running():
+            page = self.browser_manager.get_page()
+            if page:
+                if self.current_workflow is None:
+                    try:
+                        has_login = page.locator("a:has-text('Logout'), span:has-text('Welcome')").count() > 0
+                        if has_login:
+                            self.current_workflow = IRCTCWorkflow(page=page, status_callback=self._update_workflow_status)
+                            self.current_workflow.sm.add_listener(self._on_state_machine_transition)
+                            if self.clock.is_tatkal_open(selected_class):
+                                self.current_workflow.sm.transition_to(BookingState.USER_LOGGED_IN, "User logged in")
+                            else:
+                                self.current_workflow.sm.transition_to(BookingState.WAITING_FOR_TATKAL, "Waiting for Tatkal")
+                    except Exception:
+                        pass
+
+                if self.current_workflow is not None:
+                    self.current_workflow.check_and_send_keep_alive(force=False)
 
         if self.clock.is_tatkal_open(selected_class):
             if not self._opening_alert_fired:
